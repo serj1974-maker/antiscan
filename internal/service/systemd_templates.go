@@ -52,25 +52,24 @@ WantedBy=timers.target
 # AntiscanSimple Log Aggregation Script
 # Output CSV format: DATETIME|IP_ADDRESS|ASN|NETNAME|PORT
 # Each blocked connection is appended as a separate row (no deduplication).
+# Reads kernel journal entries via journalctl with cursor tracking — no rsyslog required.
 
-set -uo pipefail
+set -euo pipefail
 
-IPV4_LOG="/var/log/iptables-scanners-ipv4.log"
 OUTPUT_CSV="/var/log/iptables-scanners-aggregate.csv"
 WHOIS_CACHE="/tmp/antiscan-whois-cache.txt"
-TEMP_IPV4="/tmp/antiscan-ipv4-$$.tmp"
+CURSOR_FILE="/var/lib/antiscan/journal-cursor"
+LOCK_FILE="/var/lock/antiscan-aggregate.lock"
+
+# Prevent concurrent execution
+exec 9>"$LOCK_FILE"
+flock -n 9 || exit 0
 
 # Invalidate whois cache if older than 1 day
 if [ -f "$WHOIS_CACHE" ]; then
     find "$WHOIS_CACHE" -mtime +1 -delete 2>/dev/null || true
 fi
 touch "$WHOIS_CACHE"
-
-# Move the log file atomically (rename syscall — no entries are lost).
-# rsyslog holds the old inode open via fd and keeps writing there until
-# it reopens the path; we process whatever ends up in TEMP_IPV4.
-if [ ! -f "$IPV4_LOG" ]; then exit 0; fi
-if ! mv "$IPV4_LOG" "$TEMP_IPV4" 2>/dev/null; then exit 0; fi
 
 # Return cached or fresh ASN|NETNAME for an IP
 get_ip_info() {
@@ -101,57 +100,57 @@ if [ ! -f "$OUTPUT_CSV" ] || ! head -1 "$OUTPUT_CSV" 2>/dev/null | grep -q "^DAT
     echo "DATETIME|IP_ADDRESS|ASN|NETNAME|PORT" > "$OUTPUT_CSV"
 fi
 
-# One CSV row per blocked request.
-# $1 from rsyslog template is RFC3339 (e.g. 2026-04-30T22:21:21.599309+03:00);
-# substr extracts local YYYY-MM-DD HH:MM:SS without fractional seconds or offset.
-# SRC= and DPT= are matched via substr() — no regex interval syntax {N} required.
-if [ -f "$TEMP_IPV4" ] && [ -s "$TEMP_IPV4" ]; then
-    grep 'ANTISCAN-v4:' "$TEMP_IPV4" | awk '{
-        ts = substr($1,1,10) " " substr($1,12,8); ip = ""; port = ""
-        for (i = 1; i <= NF; i++) {
-            if (substr($i,1,4) == "SRC=") ip   = substr($i,5)
-            if (substr($i,1,4) == "DPT=") port = substr($i,5)
-        }
-        if (ip != "") print ts "|" ip "|" (port != "" ? port : "UNKNOWN")
-    }' | while IFS='|' read -r ts ip port; do
-        info=$(get_ip_info "$ip")
-        printf '%s|%s|%s|%s\n' "$ts" "$ip" "$info" "$port"
-    done >> "$OUTPUT_CSV"
+# Build journalctl cursor argument
+CURSOR_ARG=""
+if [ -f "$CURSOR_FILE" ] && [ -s "$CURSOR_FILE" ]; then
+    CURSOR_ARG="--after-cursor=$(cat "$CURSOR_FILE")"
 fi
 
-rm -f "$TEMP_IPV4"
+# Read kernel journal entries with cursor tracking
+TEMP_JOURNAL=$(mktemp /tmp/antiscan-journal-XXXXXX.tmp)
+trap 'rm -f "$TEMP_JOURNAL"' EXIT
+
+if ! journalctl -k $CURSOR_ARG --output=short-iso --show-cursor 2>/dev/null > "$TEMP_JOURNAL"; then
+    # Stale cursor — retry from current boot
+    rm -f "$CURSOR_FILE"
+    journalctl -k --output=short-iso --show-cursor 2>/dev/null > "$TEMP_JOURNAL" || true
+fi
+
+# Save new cursor
+NEW_CURSOR=$(grep '^-- cursor: ' "$TEMP_JOURNAL" | tail -1 | sed 's/^-- cursor: //')
+if [ -n "$NEW_CURSOR" ]; then
+    mkdir -p /var/lib/antiscan
+    printf '%s\n' "$NEW_CURSOR" > "$CURSOR_FILE"
+fi
+
+# One CSV row per blocked request.
+# short-iso format: "2026-06-01T12:34:56+0300 hostname kernel: [optional] ANTISCAN-v4: ..."
+# substr($1,1,10) extracts "2026-06-01", substr($1,12,8) extracts "12:34:56".
+# SRC= and DPT= are matched via substr() — no regex interval syntax {N} required.
+grep 'ANTISCAN-v4:' "$TEMP_JOURNAL" 2>/dev/null | awk '{
+    ts = substr($1,1,10) " " substr($1,12,8); ip = ""; port = ""
+    for (i = 1; i <= NF; i++) {
+        if (substr($i,1,4) == "SRC=") ip   = substr($i,5)
+        if (substr($i,1,4) == "DPT=") port = substr($i,5)
+    }
+    if (ip != "") print ts "|" ip "|" (port != "" ? port : "UNKNOWN")
+}' | while IFS='|' read -r ts ip port; do
+    info=$(get_ip_info "$ip")
+    printf '%s|%s|%s|%s\n' "$ts" "$ip" "$info" "$port"
+done >> "$OUTPUT_CSV" || true
+
 exit 0
 `
 
-	// RsyslogConfigTemplate is the rsyslog configuration for iptables logging
-	RsyslogConfigTemplate = `template(name="antiscan_tmpl" type="string" string="%TIMESTAMP:::date-rfc3339% %msg%\n")
-:msg, contains, "ANTISCAN-v4: " action(type="omfile" file="/var/log/iptables-scanners-ipv4.log" template="antiscan_tmpl")
-& stop
-`
-
 	// LogrotateConfigTemplate is the logrotate configuration
-	LogrotateConfigTemplate = `/var/log/iptables-scanners-*.log {
-    daily
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    create 0640 syslog adm
-    sharedscripts
-    postrotate
-        /usr/lib/rsyslog/rsyslog-rotate
-    endscript
-}
-
-/var/log/iptables-scanners-aggregate.csv {
+	LogrotateConfigTemplate = `/var/log/iptables-scanners-aggregate.csv {
     weekly
     rotate 4
     compress
     delaycompress
     missingok
     notifempty
-    create 0640 syslog adm
+    create 0640 root adm
 }
 `
 )
@@ -162,8 +161,8 @@ const (
 	AggregateLogsServicePath = "/etc/systemd/system/antiscan-aggregate.service"
 	AggregateLogsTimerPath   = "/etc/systemd/system/antiscan-aggregate.timer"
 	AggregateLogsScriptPath  = "/usr/local/bin/antiscan-aggregate-logs.sh"
-	RsyslogConfigPath        = "/etc/rsyslog.d/10-iptables-scanners.conf"
 	LogrotateConfigPath      = "/etc/logrotate.d/iptables-scanners"
+	JournalCursorPath        = "/var/lib/antiscan/journal-cursor"
 	UpdateServicePath        = "/etc/systemd/system/antiscan-simple-update.service"
 	UpdateTimerPath          = "/etc/systemd/system/antiscan-simple-update.timer"
 	DockerRulesServicePath   = "/etc/systemd/system/antiscan-docker-rules.service"
@@ -237,6 +236,5 @@ const (
 
 // LogPaths contains paths for log files
 const (
-	IPv4LogPath      = "/var/log/iptables-scanners-ipv4.log"
 	AggregateLogPath = "/var/log/iptables-scanners-aggregate.csv"
 )

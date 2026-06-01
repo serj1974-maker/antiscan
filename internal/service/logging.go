@@ -21,13 +21,10 @@ func NewLoggingService(logger zerolog.Logger, cmdSvc *CommandService) *LoggingSe
 	}
 }
 
-// Setup configures rsyslog, logrotate, and aggregation script
+// Setup configures logrotate and the aggregation script/timer.
+// Reads iptables kernel log entries via journald — no rsyslog required.
 func (s *LoggingService) Setup() error {
 	s.logger.Info().Msg("Configuring logging")
-
-	if err := s.setupRsyslog(); err != nil {
-		return fmt.Errorf("failed to setup rsyslog: %w", err)
-	}
 
 	if err := s.setupLogrotate(); err != nil {
 		return fmt.Errorf("failed to setup logrotate: %w", err)
@@ -41,24 +38,10 @@ func (s *LoggingService) Setup() error {
 		return fmt.Errorf("failed to setup aggregation timer: %w", err)
 	}
 
-	if err := s.restartRsyslog(); err != nil {
-		s.logger.Warn().Err(err).Msg("Failed to restart rsyslog — may require manual restart")
-	}
-
 	s.logger.Info().Msg("Logging configured")
-	s.logger.Info().Msg("  Raw logs:        /var/log/iptables-scanners-ipv4.log")
 	s.logger.Info().Msg("  Aggregated CSV:  /var/log/iptables-scanners-aggregate.csv (updated every 30s)")
-	s.logger.Info().Msg("  Rate limit:      10 entries/minute")
 	s.logger.Info().Msg("  Timer status:    systemctl status antiscan-aggregate.timer")
 
-	return nil
-}
-
-func (s *LoggingService) setupRsyslog() error {
-	if err := os.WriteFile(RsyslogConfigPath, []byte(RsyslogConfigTemplate), 0644); err != nil {
-		return fmt.Errorf("write %s: %w", RsyslogConfigPath, err)
-	}
-	s.logger.Info().Str("path", RsyslogConfigPath).Msg("rsyslog config created")
 	return nil
 }
 
@@ -104,10 +87,3 @@ func (s *LoggingService) setupAggregationTimer() error {
 	return nil
 }
 
-func (s *LoggingService) restartRsyslog() error {
-	if err := s.cmdSvc.RestartService("rsyslog"); err != nil {
-		return err
-	}
-	s.logger.Info().Msg("rsyslog restarted")
-	return nil
-}

@@ -50,10 +50,6 @@ func (s *UninstallerService) Uninstall(removeLogs bool) error {
 		s.logger.Warn().Err(err).Msg("Failed to reload systemd daemon")
 	}
 
-	if err := s.reloadRsyslog(); err != nil {
-		s.logger.Warn().Err(err).Msg("Failed to reload rsyslog")
-	}
-
 	if err := s.persistFirewallState(); err != nil {
 		return fmt.Errorf("failed to persist firewall state: %w", err)
 	}
@@ -152,7 +148,6 @@ func (s *UninstallerService) removeArtifacts(removeLogs bool) {
 		AggregateLogsServicePath,
 		AggregateLogsTimerPath,
 		AggregateLogsScriptPath,
-		RsyslogConfigPath,
 		LogrotateConfigPath,
 		UpdateServicePath,
 		UpdateTimerPath,
@@ -171,6 +166,10 @@ func (s *UninstallerService) removeArtifacts(removeLogs bool) {
 	}
 	if err := state.RemoveDir(); err != nil {
 		s.logger.Debug().Err(err).Msg("State directory not removed (likely not empty)")
+	}
+
+	if err := os.RemoveAll(filepath.Dir(JournalCursorPath)); err != nil && !os.IsNotExist(err) {
+		s.logger.Warn().Err(err).Str("path", filepath.Dir(JournalCursorPath)).Msg("Failed to remove journal cursor directory, continuing")
 	}
 
 	if !removeLogs {
@@ -196,20 +195,6 @@ func (s *UninstallerService) reloadSystemdDaemon() error {
 	}
 
 	return s.cmdSvc.DaemonReload()
-}
-
-func (s *UninstallerService) reloadRsyslog() error {
-	if !s.cmdSvc.CommandExists("systemctl") {
-		return nil
-	}
-
-	// Check if rsyslog service exists and is active
-	if err := s.cmdSvc.Run("systemctl", "is-active", "rsyslog"); err != nil {
-		s.logger.Debug().Msg("rsyslog is not active, skipping reload")
-		return nil
-	}
-
-	return s.cmdSvc.RestartService("rsyslog")
 }
 
 func (s *UninstallerService) persistFirewallState() error {

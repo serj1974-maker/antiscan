@@ -101,16 +101,6 @@ func (s *InstallerService) EnsureLoggingDependencies() error {
 	}
 	s.logger.Debug().Str("pkg", "whois").Msg("Dependency installed")
 
-	if !s.cmdSvc.CommandExists("rsyslog") && !s.cmdSvc.CommandExists("rsyslogd") {
-		return fmt.Errorf(
-			"rsyslog is not installed (required for iptables log capture).\n" +
-				"Install manually:\n" +
-				"  Debian/Ubuntu: sudo apt-get install rsyslog\n" +
-				"  RHEL/CentOS:   sudo yum install rsyslog",
-		)
-	}
-	s.logger.Debug().Str("pkg", "rsyslog").Msg("Dependency installed")
-
 	s.logger.Info().Msg("All logging dependencies satisfied")
 	return nil
 }
